@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# Функция для ожидания завершения задачи
+wait_for_status() {
+    local object_type=$1
+    local object_id=$2
+    local desired_status=$3
+    local current_status
+
+    while true; do
+        current_status=$(openstack $object_type show $object_id -f value -c status)
+        if [ "$current_status" = "$desired_status" ]; then
+            break
+        elif [ "$current_status" = "error" ]; then
+            echo "Error: $object_type $object_id is in error state"
+            exit 1
+        fi
+        sleep 10
+    done
+}
+
+# ID volume для резервного копирования
+volume_id="abcde-12345"
+
+# Генерация уникальных имен
+timestamp=$(date +%Y%m%d%H%M%S)
+snapshot_name="snapshot_${volume_id}_${timestamp}"
+clone_volume_name="clone_${volume_id}_${timestamp}"
+image_name="image_${volume_id}_${timestamp}"
+backup_name="backup_${volume_id}_${timestamp}.qcow2"
+
+# 1. Создание снимка volume
+openstack volume snapshot create --volume $volume_id --force $snapshot_name
+wait_for_status "volume snapshot" $snapshot_name "available"
+
+# 2. Создание клона volume из снимка
+openstack volume create --snapshot $snapshot_name $clone_volume_name
+wait_for_status "volume" $clone_volume_name "available"
+
+# 3. Создание образа из клона volume
+openstack image create --volume $clone_volume_name $image_name
+wait_for_status "image" $image_name "active"
+
+# 4. Сохранение образа в файл
+openstack image save --file /tmp/openstack_backups/$backup_name $image_name
+
+# Ожидание завершения сохранения файла
+while [ ! -f /tmp/openstack_backups/$backup_name ] || [ "$(lsof /tmp/openstack_backups/$backup_name)" ]; do
+    sleep 10
+done
+
+# 5. Удаление образа
+openstack image delete $image_name
+
+# 6. Удаление клона volume
+openstack volume delete $clone_volume_name
+
+# 7. Удаление снимка
+openstack volume snapshot delete $snapshot_name
+
+echo "Backup completed: /tmp/openstack_backups/$backup_name"
