@@ -1,0 +1,142 @@
+#!/bin/bash
+
+# Функция для логирования
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+# Функция для ожидания завершения задачи
+wait_for_status() {
+    local object_type=$1
+    local object_id=$2
+    local desired_status=$3
+    local max_attempts=${4:-60}  # По умолчанию 60 попыток (10 минут)
+    local current_status
+    local attempt=0
+
+    log_message "Waiting for $object_type $object_id to reach status $desired_status"
+    while [ $attempt -lt $max_attempts ]; do
+        current_status=$(openstack $object_type show $object_id -f value -c status)
+        log_message "Current status of $object_type $object_id: $current_status"
+        if [ "$current_status" = "$desired_status" ]; then
+            log_message "$object_type $object_id reached desired status: $desired_status"
+            return 0
+        elif [ "$current_status" = "error" ]; then
+            log_message "Error: $object_type $object_id is in error state"
+            return 1
+        fi
+        attempt=$((attempt + 1))
+        log_message "Attempt $attempt of $max_attempts. Waiting 10 seconds before next check."
+        sleep 10
+    done
+    log_message "Timeout reached. $object_type $object_id did not reach $desired_status status"
+    return 1
+}
+
+# Функция для определения каталога бэкапа
+get_backup_dir() {
+    local volume_id=$1
+    case $volume_id in
+        volume-a|volume-b) echo "/data/1/" ;;
+        volume-c|volume-d) echo "/data/2/" ;;
+        volume-e|volume-f) echo "/data/3/" ;;
+        *) echo ""; return 1 ;;
+    esac
+}
+
+# Функция для создания резервной копии одного volume
+backup_volume() {
+    local volume_id=$1
+
+    log_message "Starting backup process for volume $volume_id"
+
+    # Генерация уникальных имен
+    local timestamp=$(date +%Y%m%d%H%M%S)
+    local snapshot_name="snapshot_${volume_id}_${timestamp}"
+    local clone_volume_name="clone_${volume_id}_${timestamp}"
+    local image_name="image_${volume_id}_${timestamp}"
+    local backup_name="backup_${volume_id}_${timestamp}.qcow2"
+
+    log_message "Generated names: snapshot=$snapshot_name, clone=$clone_volume_name, image=$image_name, backup=$backup_name"
+
+    # 1. Создание снимка volume
+    log_message "Creating snapshot of volume $volume_id"
+    openstack volume snapshot create --volume $volume_id --force $snapshot_name
+    wait_for_status "volume snapshot" $snapshot_name "available" 30 || return 1
+
+    # 2. Создание клона volume из снимка
+    log_message "Creating clone volume from snapshot"
+    openstack volume create --snapshot $snapshot_name $clone_volume_name
+    wait_for_status "volume" $clone_volume_name "available" 120 || return 1
+
+    # Дополнительная проверка статуса клона
+    log_message "Double-checking clone volume status"
+    local clone_status=$(openstack volume show $clone_volume_name -f value -c status)
+    if [ "$clone_status" != "available" ]; then
+        log_message "Clone volume is not in 'available' status. Current status: $clone_status"
+        return 1
+    fi
+
+    # 3. Создание образа из клона volume
+    log_message "Creating image from clone volume"
+    openstack image create --volume $clone_volume_name $image_name
+    wait_for_status "image" $image_name "active" 180 || return 1
+
+    # Определение каталога для бэкапа
+    local backup_dir=$(get_backup_dir "$volume_id")
+    if [ -z "$backup_dir" ]; then
+        log_message "Error: Unable to determine backup directory for volume $volume_id"
+        return 1
+    fi
+
+    log_message "Backup directory determined: $backup_dir"
+
+    # Создание директории для бэкапов, если она не существует
+    mkdir -p "$backup_dir"
+    log_message "Ensured backup directory exists: $backup_dir"
+
+    # 4. Сохранение образа в файл
+    log_message "Saving image to file: $backup_dir/$backup_name"
+    openstack image save --file "$backup_dir/$backup_name" $image_name
+
+    # Ожидание завершения сохранения файла
+    log_message "Waiting for file save to complete"
+    while [ ! -f "$backup_dir/$backup_name" ] || [ "$(lsof "$backup_dir/$backup_name")" ]; do
+        log_message "File is still being written. Waiting..."
+        sleep 10
+    done
+    log_message "File save completed"
+
+    # 5. Удаление образа
+    log_message "Deleting image: $image_name"
+    openstack image delete $image_name
+
+    # 6. Удаление клона volume
+    log_message "Deleting clone volume: $clone_volume_name"
+    openstack volume delete $clone_volume_name
+
+    # 7. Удаление снимка
+    log_message "Deleting snapshot: $snapshot_name"
+    openstack volume snapshot delete $snapshot_name
+
+    log_message "Backup completed for volume $volume_id: $backup_dir/$backup_name"
+}
+
+# Список ID volume для резервного копирования
+volume_ids=(
+    "volume-a" "volume-b"
+    "volume-c" "volume-d"
+    "volume-e" "volume-f"
+)
+
+# Цикл по всем volume_ids
+for volume_id in "${volume_ids[@]}"; do
+    log_message "Processing volume: $volume_id"
+    if backup_volume "$volume_id"; then
+        log_message "Backup process successful for volume $volume_id"
+    else
+        log_message "Backup process failed for volume $volume_id"
+    fi
+done
+
+log_message "All backup processes completed"
