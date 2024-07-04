@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Имя снапшота и тома
+SNAPSHOT_NAME="snapshot-name"
+VOLUME_NAME="volume-name"
+
+# Создаем том из снапшота
+openstack volume create --snapshot $SNAPSHOT_NAME $VOLUME_NAME
+
+# Функция для получения статуса тома с временной меткой
+get_volume_status() {
+    local status
+    status=$(openstack volume show $VOLUME_NAME -f value -c status)
+    echo "$(date +%Y-%m-%d\ %H:%M:%S.%3N) - Status: $status"
+}
+
+# Устанавливаем время окончания (20 минут от текущего времени)
+end_time=$(($(date +%s) + 1200))
+
+# Цикл опроса статуса
+while [ $(date +%s) -lt $end_time ]
+do
+    get_volume_status
+    sleep 0.1  # Пауза 100 миллисекунд между опросами
+done
